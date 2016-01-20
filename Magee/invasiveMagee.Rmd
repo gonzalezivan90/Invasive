@@ -1,0 +1,152 @@
+---
+title: "Invasive"
+author: "Ivan Gonzalez"
+date: "October 13, 2015"
+output: pdf_document
+---
+
+El siguiente código replica la metodología propuesta por Magee y colaboradores (2009) y presenta una agregación para capas políticas y administrativas de Colombia.
+
+```{r setdir, echo = FALSE}
+setwd("C:/IAvH/BioReportes/products/invasive/Magee")
+```
+
+Cargar paquetes necesarios
+```{r pack}
+memory.limit(size = 30000)
+library(raster)
+library(maptools)
+library(sp)
+library(rgdal)
+library(GGally)
+```
+
+
+#2. INVASIBILIDAD
+Se carga la información de los factores
+```{r factors, echo = TRUE, cache = TRUE, message=F, warning=F}
+colombia <- readOGR('.', 'COLOMBIA')
+natural <- raster('natural.tif')
+transformado <- raster('transformado.tif')
+
+# Cercania areas portegidas
+DIST_PNN <- raster('distProtArea.tif')
+DIST_VIAS <- raster('distWays_prj.tif')
+DIST_CASCOS <- raster("distUrban.tif" )
+  
+# Porcentaje de vecinos 
+areas <- natural
+areas[areas == 3] <- 1
+areas[is.na(areas)] <- 0
+vecinos.nat <- focal(areas, w = matrix(1/9, nrow = 3, ncol = 3))
+vecinos.nat <- vecinos.nat * 100
+
+# Estandarizar y cortar
+estandar01 <- function(x){
+  return((x - min(x[], na.rm = TRUE))/(max(x[], na.rm = TRUE) - min(x[], na.rm = TRUE)))
+}
+
+DIST_PNN_EST <- estandar01(mask(DIST_PNN, colombia))
+DIST_CASCOS_EST <- 1 - estandar01(mask(DIST_CASCOS, colombia))
+#DIST_VIAS <- projectRaster(DIST_VIAS, crs = colombia@proj4string)
+#DIST_VIAS <- resample(DIST_VIAS, DIST_PNN_EST, filename = 'distWays_prj.tif')
+DIST_VIAS_EST <- 1 - estandar01(mask(DIST_VIAS, colombia))
+
+par(mfrow = c(2, 3))
+plot(DIST_PNN_EST, main="DIST PNN")
+plot(DIST_CASCOS_EST, main="DIST CASCOS")
+plot(DIST_VIAS_EST, main="DIST VIAS")
+plot(transformado, main="TRANSFORMADO")
+plot(vecinos.nat, main="CONECTIVIDAD")
+
+factorsDF <- na.omit(as.data.frame(stack(DIST_PNN_EST, DIST_CASCOS_EST, DIST_VIAS_EST, vecinos.nat)))
+names(factorsDF) <- c('dist_PNN', 'dist_Urban', 'dist_Vias', 'Conectividad')
+cor(factorsDF)
+```
+
+Una vez teniendo lista la información se hace la suma de factores. Se realizará una suma variando la presencia de la capa de vecinos y ecosistemas transformados en la ecuación. Se grafican los resultados y la relación entre los tres resultados
+```{r calc_variables, cache = TRUE}
+AREA_PELIGRO_todo <- (transformado + DIST_PNN_EST + DIST_CASCOS_EST + DIST_VIAS_EST + (vecinos.nat/100))/5
+AREA_PELIGRO_tran <- (transformado + DIST_PNN_EST + DIST_CASCOS_EST + DIST_VIAS_EST)/4
+AREA_PELIGRO_cone <- (DIST_PNN_EST + DIST_CASCOS_EST + DIST_VIAS_EST + (vecinos.nat/100)) /4
+
+writeRaster(AREA_PELIGRO_todo, 'PELIGRO_todo.tif', overwrite = TRUE)
+writeRaster(AREA_PELIGRO_tran, 'PELIGRO_tran.tif', overwrite = TRUE)
+writeRaster(AREA_PELIGRO_cone, 'PELIGRO_cone.tif.', overwrite = TRUE)
+
+par(mfrow = c(1, 3), mar = c(3, 2, 3, 2))
+plot(AREA_PELIGRO_todo, main = "FACTORES con\nconectividad y transformado", zlim = c(0, 1))
+plot(AREA_PELIGRO_tran, main = "FACTORES con\ntransformado", zlim = c(0, 1))
+plot(AREA_PELIGRO_cone, main = "FACTORES con\nconectividad", zlim = c(0, 1))
+
+resultsDF <- na.omit(as.data.frame(stack(AREA_PELIGRO_todo, AREA_PELIGRO_tran, AREA_PELIGRO_cone)))
+names(resultsDF) <- c('Todo', 'Transf', 'Conec')
+cor(resultsDF)
+```
+
+ 
+
+#  2. INVASIVIDAD
+Se requiere dos archivos que contengan el nombre de las especies con mapas disponibles y con el valor de invasibilidad
+
+```{r speciesList, echo = TRUE}
+# Seleccionar especies con modelos disponibles
+speciesMod <- read.csv("SpTaxonomy.csv", as.is = TRUE)
+riesgo <- read.csv("Clasificacion de riesgo.csv", as.is = TRUE)
+riesgo$scientificName <- gsub('_', ' ', riesgo$especie_aceptada)             
+riesgo.especies <- riesgo[which(riesgo$scientificName %in% speciesMod$scientificName & 
+                                  !is.na(riesgo$Calificación.de.riesgo)), ]
+
+riesgo.especies$est <- as.numeric(riesgo.especies$Calificación.de.riesgo)/
+  max(as.numeric(riesgo.especies$Calificación.de.riesgo)) + 1
+```
+
+Se cargan los mapas de probabilidad de cada especie
+```{r speciesMaps, echo = FALSE, cache = TRUE}
+# 2.1 Idoneidad de establecimimento potencial
+modelos <- paste0('tifs2014/', riesgo.especies$scientificName, ".tif")
+MODELOS <- stack(modelos)
+names(MODELOS) <- riesgo.especies$scientificName
+```
+
+Se genera el calculo por cada especie usando los mapas de idoneidad y el valor de invasibilidad
+```{r calc_species, cache = TRUE}
+AREA_PELIGRO <- resample(AREA_PELIGRO_todo, MODELOS[[1]])
+RIESGOS <- stack()
+for (i in 1:length(modelos)){
+  invasividad <- riesgo.especies$est[i]
+  idoneidad <- MODELOS[[i]]
+  idoneidad[is.na(idoneidad[])] <- 0
+  invasibilidad <- (idoneidad + 1) * invasividad
+  riesgo <- log( (AREA_PELIGRO * invasibilidad) + 1)
+  RIESGOS <- addLayer(RIESGOS, riesgo)
+  cat(paste(i))
+}
+
+sum.riesgos <- sum(RIESGOS)
+sum.riesgos.est <- estandar01(sum.riesgos)
+writeRaster(sum.riesgos, 'riesgo.tif', overwrite = TRUE)
+writeRaster(sum.riesgos.est, 'riesgo_01.tif', overwrite = TRUE)
+
+par(mfrow = c(1, 1))
+plot(sum.riesgos.est, 'Estandar')
+```
+
+```{r plottHide, echo = FALSE, cache = TRUE}
+png('Magee_Results_bgGrey.png', width = 1200, height = 800, units = 'px')
+par(mfrow = c(1, 3), bg = 'lightgrey', bty = 'n')
+plot(AREA_PELIGRO_todo, xlab = '', ylab = '', axes = FALSE)
+plot(AREA_PELIGRO_tran, xlab = '', ylab = '', axes = FALSE)
+plot(AREA_PELIGRO_cone, xlab = '', ylab = '', axes = FALSE)
+dev.off()
+
+png('Magee_Factors_bgGrey.png', width = 1200, height = 800, units = 'px')
+par(mfrow = c(2, 3), bg = 'lightgrey', bty = 'n')
+plot(transformado, xlab = '', ylab = '', axes = FALSE)
+plot(DIST_PNN_EST, xlab = '', ylab = '', axes = FALSE)
+plot(DIST_CASCOS_EST, xlab = '', ylab = '', axes = FALSE)
+plot(DIST_VIAS_EST, xlab = '', ylab = '', axes = FALSE)
+plot(vecinos.nat, xlab = '', ylab = '', axes = FALSE)
+dev.off()
+
+```

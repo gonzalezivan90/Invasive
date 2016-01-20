@@ -1,0 +1,141 @@
+---
+title: "Invasive index: de-Val et al. 2015)"
+author: "Ivan Gonzalez"
+date: "October 13, 2015"
+output: pdf_document
+---
+
+El siguiente código replica la metodología propuesta por de-Val y colaboradores (2015) y presenta una agregación para capas políticas y administrativas de Colombia.
+```{r setwd, echo = FALSE}
+setwd('C:/IAvH/BioReportes/products/invasive/delVal/')
+```
+
+Load libraries
+```{r lib}
+library(rgdal)
+library(raster)
+library(GGally)
+```
+
+
+Load requiered maps
+```{r factors, cache=TRUE}
+colombia <- readOGR('.','COLOMBIA')
+mapID <- raster('rasterID_cover.tif')
+deptos <- readOGR('.', 'deptos', encoding = 'UTF-8', stringsAsFactors = FALSE)
+deptos <- spTransform(deptos, mapID@crs)
+
+## Propaguele availbility index (PAI)
+popRaster <- raster('popDens.tif')
+nrowRoadDensity <- 117920
+pxRaster <- raster('roadDensity.tif')
+roadRaster <- pxRaster * (nrowRoadDensity - 1)
+roadRaster@crs <- popRaster@crs
+rm(pxRaster)
+
+projRoad <- raster('projRoad.tif')
+roadRaster <- raster('roadDens.tif')
+
+pai1 <- projRoad * popRaster
+pai2 <- log(projRoad) * popRaster
+pai3 <- projRoad * log(popRaster)
+pai4 <- log(projRoad) * log(popRaster)
+
+paiStack <- stack(pai1, pai2, pai3, pai4)
+names(paiStack) <- c('PAI1', 'PAI2', 'PAI3', 'PAI4')
+paiDF <- as.data.frame(paiStack)
+paiDF <- na.omit(paiDF)
+inf <- which(paiDF[, 2] != -Inf & paiDF[, 1] != 0, arr.ind = TRUE)
+paiDF <- paiDF[inf, ]
+
+# pairs(paiDF) # Avoid run due overload pdf plots
+
+## Biophysical condition index (BCI)
+bci <- raster('reclassImpact.tif')
+
+## Disturbance index (DI)
+di <- raster('reclassDist.tif')
+
+## Species richness index (SRI)
+sri <- raster('alphaBiomod.tif')
+
+```
+
+```{r index, cache = TRUE}
+## Invasion risk index (IRI)
+paiMask <- raster('mask_pai.tif')
+bciMask <- raster('mask_bci.tif')
+diMask <- raster('mask_di.tif')
+sriMask <- raster('mask_sri.tif')
+
+paiNorm <- (paiMask - paiMask@data@min)/(paiMask@data@max - paiMask@data@min)
+bciNorm <- (bciMask - bciMask@data@min)/(bciMask@data@max - bciMask@data@min)
+sriNorm <- (sriMask - sriMask@data@min)/(sriMask@data@max - sriMask@data@min)
+diNorm <- (diMask - diMask@data@min)/(diMask@data@max - diMask@data@min)
+
+par(mfrow = c(2, 3))
+plot(popRaster, main = 'Population\ndensity')
+plot(roadRaster, main = 'Road density')
+plot(paiNorm, main = 'PAI\nPropaguele availbility index')
+plot(bciNorm, main = 'BCI\nBiophysical condition index')
+plot(sriNorm, main = 'SRI\nSpecies richness index')
+plot(diNorm, main = 'DI\nDisturbance index')
+
+iri <- paiMask + bciMask + diMask + sriMask
+iri2 <- paiMask + diMask + sriMask
+writeRaster(iri, 'IRI.tif', overwrite = TRUE)
+writeRaster(iri2, 'IRI2.tif', overwrite = TRUE)
+
+par(mfrow = c(1, 2))
+plot(iri, main = 'Invasion Risk\nIndex')
+plot(iri2, main = 'Invasion Risk\nIndex (using BCI)')
+```
+
+
+```{r validation, cache=TRUE}
+invCoords <- read.csv('invasiveCoords.csv', stringsAsFactors = FALSE)
+invCoords <- SpatialPointsDataFrame(coords = cbind(invCoords$lon, invCoords$lat),
+                                    data = invCoords, proj4string = mapID@crs)
+densRegistros <- rasterize(invCoords, iri, field = invCoords$invasive, fun = sum, na.rm = TRUE)
+invCoords@proj4string <- iri@crs
+
+extVals <- raster:::extract(iri, invCoords)
+extDens <- raster:::extract(densRegistros, invCoords)
+
+valsTable <- na.omit(data.frame(extVals, extDens))
+plot(log(valsTable$extVals), log(valsTable$extDens), pch = 20, cex = .7)
+plot(valsTable$extVals, valsTable$extDens, pch = 20, cex = .7)
+
+recordsByDepto <- over(invCoords, deptos)
+deptoTableSp <- table(recordsByDepto$NOM_DPTO, invCoords$acceptedNameUsage)
+deptoTable <- data.frame(deptoTableSp)
+recordsCount <- rowSums(deptoTableSp)
+spCount <- apply(deptoTableSp, 1, function(x) length(which(x != 0)))
+
+deptoTable0 <- data.frame(Depto = names(recordsCount), records = recordsCount, logrecords = log(recordsCount),
+                         sp = spCount, logsp = log(spCount), stringsAsFactors = FALSE)
+
+layerStack <- stack(popRaster, roadRaster, paiMask, bciMask, diMask, sriMask, paiNorm, bciNorm, sriNorm, diNorm, iri, iri2)
+names(layerStack) <- c('POP', 'ROAD', 'PAI', 'BCI', 'DI', 'SRI', 'PAIn', 'BCIn', 'SRIn', 'DIn', 'IRI', 'IRI2')
+
+deptoTable <- data.frame(deptoTable0, matrix(0, nrow(deptoTable0), length(names(layerStack))))
+colnames(deptoTable) <- c(colnames(deptoTable0), names(layerStack))
+
+for(d in 1:nrow(deptoTable)){
+  dept.d <- deptoTable$Depto[d]
+  shape.d <- deptos[deptos$NOM_DPTO == dept.d, ]
+  stack.d <- crop(layerStack, y = shape.d)
+  mask.d <- mask(stack.d, shape.d)
+  vasl.d <- sapply(1:length(names(stack.d)), function(x) { mean(mask.d[[x]][], na.rm = TRUE) })
+  deptoTable[d, c(names(layerStack))] <- vasl.d
+  cat(d, '-', nrow(deptoTable), '|| ')
+}
+
+write.csv(deptoTable, 'deptoTable.csv', row.names = FALSE)
+#deptoTable <- read.csv('deptoTable.csv', as.is = TRUE)
+#ggpairs(deptoTable[, -c(1)])
+#pairs(deptoTable[, -c(1)], pch = 20, col = rgb(0.5, 0.5, 1, 0.5))
+corDeptoTable <- cor(deptoTable[, -c(1)])
+round(corDeptoTable, 2)
+write.csv(corDeptoTable, 'corDeptoTable.csv')
+```
